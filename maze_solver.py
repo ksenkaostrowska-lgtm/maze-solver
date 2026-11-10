@@ -24,13 +24,13 @@ from controller import Robot
 MAX_SPEED = 6.28
 WHEEL_RADIUS = 0.0205
 WHEELS_DIST = 0.052
-WALL_CLOSE = 80
-SIDE_WALL = 75
-SIDE_SETPOINT = 110
+WALL_CLOSE = 100
+SIDE_WALL = 110
+FRONT_STOP = 150.0
 KP_BOTH = 0.003
 KP_ONE = 0.004
 KP_ENC = 2
-MAX_CORR = 0.5
+MAX_CORR = 0.35
 
 robot = Robot()
 timestep = int(robot.getBasicTimeStep())
@@ -79,58 +79,111 @@ def is_wall_on_left():
     or distance_sensors[6].getValue() > WALL_CLOSE)
 
 
-def drive_correction(base_speed, start_l, start_r):
-    """Zwraca (v_left, v_right) tak, by robot jechał środkiem korytarza.
-    Tryby: dwie ściany -> centrowanie; jedna ściana -> trzymaj stały dystans;
-    brak ścian -> jedź prosto po enkoderach."""
-    left = distance_sensors[5].getValue()
-    right = distance_sensors[2].getValue()
+class DriveCorrector:
+    def __init__(self):
+        self.reset()
 
-    if left > SIDE_WALL and right > SIDE_WALL:
-        error = (left - right) * KP_BOTH
-    elif left > SIDE_WALL:
-        error = (left - SIDE_SETPOINT) * KP_ONE      # za blisko lewej -> dodatnie -> skręć w prawo
-    elif right > SIDE_WALL:
-        error = (SIDE_SETPOINT - right) * KP_ONE     # za blisko prawej -> ujemne -> skręć w lewo
-    else:
-        # brak ścian: wyrównuj drogę obu kół, żeby nie skręcać
-        dl = left_encoder.getValue() - start_l
-        dr = right_encoder.getValue() - start_r
-        error = (dl - dr) * KP_ENC
+    def reset(self):
+        self.mode = None
+        self.ref = None          # setpoint dla trybu 'left'/'right' lub (l,r) enkoderów dla 'enc'
+        self.last_corr = 0.0
+        self.walls_lost = False
 
-    corr = clamp(error, -MAX_CORR, MAX_CORR)
-    return clamp(base_speed - corr), clamp(base_speed + corr)
+    def __call__(self, base_speed):
+        left = distance_sensors[5].getValue()
+        right = distance_sensors[2].getValue()
+        has_l = left > SIDE_WALL
+        has_r = right > SIDE_WALL
 
-def align_to_front_wall(target=150.0, timeout_steps=60):
-    """Ustawia robota prostopadle do ściany z przodu i w stałej odległości."""
+        if has_l and has_r:
+            mode = "both"
+        elif has_l:
+            mode = "left"
+        elif has_r:
+            mode = "right"
+        else:
+            mode = "enc"
+
+        # mode sie zmienil, czyli ubyla lub przybyla sciana
+        if self.mode is not None and mode != self.mode:
+            prev_walls = {"both": 2, "left": 1, "right": 1, "enc": 0}
+            if prev_walls[mode] < prev_walls[self.mode]:
+                self.walls_lost = True
+            # przy przelaczeniu: zapamietaj aktualny odczyt jako setpoint
+            if mode == "left":
+                self.ref = left
+            elif mode == "right":
+                self.ref = right
+            elif mode == "enc":
+                self.ref = (left_encoder.getValue(), right_encoder.getValue())
+        elif self.mode is None:
+            self.ref = {"left": left, "right": right,
+                        "enc": (left_encoder.getValue(), right_encoder.getValue())}.get(mode)
+        self.mode = mode
+
+        if self.walls_lost:
+            error = 0.0
+        elif mode == "both":
+            error = (right - left) * KP_BOTH
+        elif mode == "left":
+            error = (self.ref - left) * KP_ONE
+        elif mode == "right":
+            error = (right - self.ref) * KP_ONE
+        else:
+            dl = left_encoder.getValue() - self.ref[0]
+            dr = right_encoder.getValue() - self.ref[1]
+            error = (dl - dr) * KP_ENC
+
+        corr = clamp(error, -MAX_CORR, MAX_CORR)
+        # rate limit: max zmiana 0.05 rad/s na krok
+        corr = clamp(corr, self.last_corr - 0.05, self.last_corr + 0.05)
+        self.last_corr = corr
+        return clamp(base_speed - corr), clamp(base_speed + corr)
+
+corrector = DriveCorrector()
+
+
+def align_to_front_wall(target=FRONT_STOP, timeout_steps=30):
+    """Ustawia robota prostopadle do sciany z przodu w stalej odleglosci."""
+    if not is_wall_in_front():
+        return
     for _ in range(timeout_steps):
         if robot.step(timestep) == -1:
             return
-        f0 = distance_sensors[0].getValue()
-        f7 = distance_sensors[7].getValue()
-        if f0 < SIDE_WALL and f7 < SIDE_WALL:
-            break                                  # nie ma ściany, nie ma do czego równać
-        dist_err = ((f0 + f7) / 2.0 - target) * 0.01   # za blisko -> cofnij
-        angle_err = (f0 - f7) * 0.01                   # różnica = skos
+        s0 = distance_sensors[0].getValue()
+        s7 = distance_sensors[7].getValue()
+        if min(s0, s7) < SIDE_WALL:
+            break
+        dist_err = ((s0 + s7) / 2.0 - target) * 0.01
+        angle_err = (s0 - s7) * 0.01       # >0: prawy blizej -> obroc w prawo
         if abs(dist_err) < 0.05 and abs(angle_err) < 0.05:
             break
-        left_motor.setVelocity(clamp(-dist_err - angle_err, -1.0, 1.0))
-        right_motor.setVelocity(clamp(-dist_err + angle_err, -1.0, 1.0))
+        left_motor.setVelocity(clamp(-dist_err + angle_err, -1.0, 1.0))
+        right_motor.setVelocity(clamp(-dist_err - angle_err, -1.0, 1.0))
     left_motor.setVelocity(0.0)
     right_motor.setVelocity(0.0)
 
 
 def is_goal_reached():
-  """Sprawdza czy robot wjechał na zielone pole końcowe (ciemniejsze od podłogi)."""
-  vals = [s.getValue() for s in ground_sensors]
-  # Podłoga ma zwykle > 700, ciemniejsze pole zielone < 550
-  return min(vals) < 550
+    """Sprawdza czy robot wjechal na zielone pole koncowe"""
+    vals = [s.getValue() for s in ground_sensors]
+    # ciemniejsze pole zielone < 550
+    return min(vals) < 550
 
-# obrót w miejscu o 90 stopni
+
+def speed_for_remaining(remaining_m, max_speed=4.0, min_speed=1.8, ramp=0.04):
+    """Predkosc kol [rad/s] zalezna od pozostalego dystansu [m]:
+    pelna predkosc, a w ostatnich metrach liniowe hamowanie do min_speed."""
+    if remaining_m <= 0:
+        return 0.0
+    v = max_speed * remaining_m / ramp
+    return clamp(v, min_speed, max_speed)
+
+# obrot w miejscu o 90 stopni
 def turn_90_degrees(direction):
     target_wheel_rad = (math.pi * WHEELS_DIST) / (4.0 * WHEEL_RADIUS) * 1.12
     
-    # pobranie pozycji początkowej z enkoderów kół
+    # pobranie pozycji poczatkowej z enkoderow kol
     start_left = left_encoder.getValue()
     start_right = right_encoder.getValue()
     
@@ -145,9 +198,8 @@ def turn_90_degrees(direction):
     while robot.step(timestep) != -1:
         current_left = left_encoder.getValue()
         current_right = right_encoder.getValue()
-        print(f"left={current_left:.2f}  right={current_right:.2f}")
         
-        # Mierzenie bezwzględnej zmiany pozycji
+        # Mierzenie bezwzglednej zmiany pozycji
         delta_left = abs(current_left - start_left)
         delta_right = abs(current_right - start_right)
         avg_delta = (delta_left + delta_right) / 2.0
@@ -160,80 +212,98 @@ def turn_90_degrees(direction):
     right_motor.setVelocity(0.0)
 
 
+EDGE_OFFSET = 0.05   # [m] ile robot powinien dojechac zanim skreci
+
 def step_one_cell_forward():
-  TARGET_DIST = 0.12
-  target_rad = TARGET_DIST / WHEEL_RADIUS
-  start_l = left_encoder.getValue()
-  start_r = right_encoder.getValue()
-  base_speed = 3.0
+    corrector.reset()
+    target_rad = 0.12 / WHEEL_RADIUS
+    start_l = left_encoder.getValue()
+    start_r = right_encoder.getValue()
+    had_l, had_r = is_wall_on_left(), is_wall_on_right()
+    stop_rad = target_rad
+    edge_seen = False
+    base_speed = 4.0
 
-  while robot.step(timestep) != -1:
-    if is_goal_reached():
-      return True
+    while robot.step(timestep) != -1:
+        ps = [s.getValue() for s in distance_sensors]
+        front = max(ps[0], ps[7])
+        left = ps[5]
+        right = ps[2]
 
-    if is_wall_in_front():
-      break
+        print(f"front={front:.0f}  left={left:.0f}  right={right:.0f}")
+        if is_goal_reached():
+            return True
+        if max(distance_sensors[0].getValue(), distance_sensors[7].getValue()) > FRONT_STOP:
+            break
 
-    dl = abs(left_encoder.getValue() - start_l)
-    dr = abs(right_encoder.getValue() - start_r)
-    if (dl + dr) / 2.0 >= target_rad:
-      break
+        travelled = (abs(left_encoder.getValue() - start_l) + abs(right_encoder.getValue() - start_r)) / 2.0
 
-    vl, vr = drive_correction(base_speed, start_l, start_r)
-    left_motor.setVelocity(vl)
-    right_motor.setVelocity(vr)
+        if not edge_seen and ((had_l and not is_wall_on_left()) or (had_r and not is_wall_on_right())):
+            edge_seen = True
+            stop_rad = travelled + EDGE_OFFSET / WHEEL_RADIUS
+            corrector.walls_lost = True            # brak sciany, jedz prosto bez korekty
 
-  left_motor.setVelocity(0.0)
-  right_motor.setVelocity(0.0)
-  return False
+        if travelled >= stop_rad:
+            if edge_seen and is_wall_in_front():
+                stop_rad = float("inf")
+            else:
+                break
+
+        remaining_m = (stop_rad - travelled) * WHEEL_RADIUS
+        base_speed = speed_for_remaining(remaining_m)
+        vl, vr = corrector(base_speed)
+        left_motor.setVelocity(vl)
+        right_motor.setVelocity(vr)
+
+    left_motor.setVelocity(0.0)
+    right_motor.setVelocity(0.0)
+    return False
 
             
             
 def right_hand_strategy():
-  """Strategia prawej ręki: faworyzuje prawą stronę."""
-  align_to_front_wall()
-  if not is_wall_on_right():
-    turn_90_degrees("right")
-    step_one_cell_forward()
-  elif not is_wall_in_front():
-    step_one_cell_forward()
-  elif not is_wall_on_left():
-    turn_90_degrees("left")
-    step_one_cell_forward()
-  else:
-    turn_90_degrees("right")
-    turn_90_degrees("right")
+    """Strategia prawej reki"""
+    align_to_front_wall()
+    if not is_wall_on_right():
+        turn_90_degrees("right")
+        step_one_cell_forward()
+    elif not is_wall_in_front():
+        step_one_cell_forward()
+    elif not is_wall_on_left():
+        turn_90_degrees("left")
+        step_one_cell_forward()
+    else:
+        turn_90_degrees("right")
+        turn_90_degrees("right")
 
 
 def left_hand_strategy():
-  """Strategia lewej ręki: faworyzuje lewą stronę."""
-  align_to_front_wall()
-  if not is_wall_on_left():
-    turn_90_degrees("left")
-    step_one_cell_forward()
-  elif not is_wall_in_front():
-    step_one_cell_forward()
-  elif not is_wall_on_right():
-    turn_90_degrees("right")
-    step_one_cell_forward()
-  else:
-    turn_90_degrees("left")
-    turn_90_degrees("left")
+    """Strategia lewej reki"""
+    align_to_front_wall()
+    if not is_wall_on_left():
+        turn_90_degrees("left")
+        step_one_cell_forward()
+    elif not is_wall_in_front():
+        step_one_cell_forward()
+    elif not is_wall_on_right():
+        turn_90_degrees("right")
+        step_one_cell_forward()
+    else:
+        turn_90_degrees("left")
+        turn_90_degrees("left")
 
 # --- Main loop ---------------------------------------------------------------
 while robot.step(timestep) != -1:
-  if is_goal_reached():
-    print("META OSIĄGNIĘTA!")
-    left_motor.setVelocity(0.0)
-    right_motor.setVelocity(0.0)
-    break
+#   if is_goal_reached():
+#     print("META OSIĄGNIĘTA!")
+#     left_motor.setVelocity(0.0)
+#     right_motor.setVelocity(0.0)
+#     break
 
-  # Tutaj wybierasz strategię, którą chcesz testować:
-  right_hand_strategy()
+    # strategia testowana
+    right_hand_strategy()
     
 
     # Uncomment to see the sensor values in the console:
-    # print(f"front={front:.0f}  left={left:.0f}  right={right:.0f}")
     # TODO: decide how the robot should move.
     # Right now it drives forward and simply stops in front of a wall.
-
