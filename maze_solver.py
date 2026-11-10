@@ -27,8 +27,8 @@ WHEELS_DIST = 0.052
 WALL_CLOSE = 100
 SIDE_WALL = 110
 FRONT_STOP = 150.0
-KP_BOTH = 0.003
-KP_ONE = 0.004
+KP_BOTH = 0.001
+KP_ONE = 0.0015
 KP_ENC = 2
 MAX_CORR = 0.35
 
@@ -75,8 +75,7 @@ def is_wall_on_right():
     return (distance_sensors[2].getValue() > WALL_CLOSE)
     
 def is_wall_on_left():
-    return (distance_sensors[5].getValue() > WALL_CLOSE 
-    or distance_sensors[6].getValue() > WALL_CLOSE)
+    return (distance_sensors[5].getValue() > WALL_CLOSE)
 
 
 class DriveCorrector:
@@ -143,7 +142,7 @@ class DriveCorrector:
 corrector = DriveCorrector()
 
 
-def align_to_front_wall(target=FRONT_STOP, timeout_steps=30):
+def align_to_front_wall(target=FRONT_STOP, timeout_steps=50):
     """Ustawia robota prostopadle do sciany z przodu w stalej odleglosci."""
     if not is_wall_in_front():
         return
@@ -187,7 +186,7 @@ def turn_90_degrees(direction):
     start_left = left_encoder.getValue()
     start_right = right_encoder.getValue()
     
-    turn_speed = 1.5
+    turn_speed = 2.5
     if direction == 'right':
         left_motor.setVelocity(turn_speed)
         right_motor.setVelocity(-turn_speed)
@@ -222,7 +221,8 @@ def step_one_cell_forward():
     had_l, had_r = is_wall_on_left(), is_wall_on_right()
     stop_rad = target_rad
     edge_seen = False
-    base_speed = 4.0
+    base_speed = 5.0
+    remaining_speed = base_speed
 
     while robot.step(timestep) != -1:
         ps = [s.getValue() for s in distance_sensors]
@@ -231,8 +231,8 @@ def step_one_cell_forward():
         right = ps[2]
 
         print(f"front={front:.0f}  left={left:.0f}  right={right:.0f}")
-        if is_goal_reached():
-            return True
+        # if is_goal_reached():
+        #     return True
         if max(distance_sensors[0].getValue(), distance_sensors[7].getValue()) > FRONT_STOP:
             break
 
@@ -241,6 +241,7 @@ def step_one_cell_forward():
         if not edge_seen and ((had_l and not is_wall_on_left()) or (had_r and not is_wall_on_right())):
             edge_seen = True
             stop_rad = travelled + EDGE_OFFSET / WHEEL_RADIUS
+            remaining_speed = speed_for_remaining((stop_rad - travelled) * WHEEL_RADIUS)
             corrector.walls_lost = True            # brak sciany, jedz prosto bez korekty
 
         if travelled >= stop_rad:
@@ -249,8 +250,9 @@ def step_one_cell_forward():
             else:
                 break
 
-        remaining_m = (stop_rad - travelled) * WHEEL_RADIUS
-        base_speed = speed_for_remaining(remaining_m)
+        # remaining_m = (stop_rad - travelled) * WHEEL_RADIUS
+        # base_speed = speed_for_remaining(remaining_m)
+        base_speed = remaining_speed
         vl, vr = corrector(base_speed)
         left_motor.setVelocity(vl)
         right_motor.setVelocity(vr)
@@ -258,8 +260,7 @@ def step_one_cell_forward():
     left_motor.setVelocity(0.0)
     right_motor.setVelocity(0.0)
     return False
-
-            
+ 
             
 def right_hand_strategy():
     """Strategia prawej reki"""
@@ -301,7 +302,7 @@ while robot.step(timestep) != -1:
 #     break
 
     # strategia testowana
-    right_hand_strategy()
+    left_hand_strategy()
     
 
     # Uncomment to see the sensor values in the console:
