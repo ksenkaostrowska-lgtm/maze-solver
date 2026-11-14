@@ -302,7 +302,7 @@ while robot.step(timestep) != -1:
 #     break
 
     # strategia testowana
-    left_hand_strategy()
+    right_hand_strategy()
     
 
     # Uncomment to see the sensor values in the console:
