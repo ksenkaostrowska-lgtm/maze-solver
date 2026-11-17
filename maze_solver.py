@@ -17,7 +17,11 @@ Wheel radius: 2.05 cm, distance between the wheels: 5.2 cm.
 
 Fill in the parts marked TODO.
 """
+import sys
+import json
+import os
 import math
+from collections import deque
 from controller import Robot
 
 # parametry robota
@@ -84,7 +88,7 @@ class DriveCorrector:
 
     def reset(self):
         self.mode = None
-        self.ref = None          # setpoint dla trybu 'left'/'right' lub (l,r) enkoderów dla 'enc'
+        self.ref = None
         self.last_corr = 0.0
         self.walls_lost = False
 
@@ -103,7 +107,7 @@ class DriveCorrector:
         else:
             mode = "enc"
 
-        # mode sie zmienil, czyli ubyla lub przybyla sciana
+        # mode sie zmienil czyli ubyla lub przybyla sciana
         if self.mode is not None and mode != self.mode:
             prev_walls = {"both": 2, "left": 1, "right": 1, "enc": 0}
             if prev_walls[mode] < prev_walls[self.mode]:
@@ -134,10 +138,18 @@ class DriveCorrector:
             error = (dl - dr) * KP_ENC
 
         corr = clamp(error, -MAX_CORR, MAX_CORR)
-        # rate limit: max zmiana 0.05 rad/s na krok
+        # max zmiana 0.05 rad/s na krok
         corr = clamp(corr, self.last_corr - 0.05, self.last_corr + 0.05)
         self.last_corr = corr
-        return clamp(base_speed - corr), clamp(base_speed + corr)
+        # return clamp(base_speed - corr), clamp(base_speed + corr)
+        vl = base_speed - corr
+        vr = base_speed + corr
+        # przesun oba kola w dol o nadwyzke, zeby zachowac roznice predkosci
+        excess = max(vl, vr) - MAX_SPEED
+        if excess > 0:
+            vl -= excess
+            vr -= excess
+        return clamp(vl), clamp(vr)
 
 corrector = DriveCorrector()
 
@@ -159,8 +171,7 @@ def align_to_front_wall(target=FRONT_STOP, timeout_steps=50):
             break
         left_motor.setVelocity(clamp(-dist_err + angle_err, -1.0, 1.0))
         right_motor.setVelocity(clamp(-dist_err - angle_err, -1.0, 1.0))
-    left_motor.setVelocity(0.0)
-    right_motor.setVelocity(0.0)
+    stop_motors()
 
 
 def is_goal_reached():
@@ -186,7 +197,7 @@ def turn_90_degrees(direction):
     start_left = left_encoder.getValue()
     start_right = right_encoder.getValue()
     
-    turn_speed = 2.5
+    turn_speed = 3.5
     if direction == 'right':
         left_motor.setVelocity(turn_speed)
         right_motor.setVelocity(-turn_speed)
@@ -207,8 +218,7 @@ def turn_90_degrees(direction):
             print(avg_delta)
             break
         
-    left_motor.setVelocity(0.0)
-    right_motor.setVelocity(0.0)
+    stop_motors()
 
 
 EDGE_OFFSET = 0.05   # [m] ile robot powinien dojechac zanim skreci
@@ -221,7 +231,7 @@ def step_one_cell_forward():
     had_l, had_r = is_wall_on_left(), is_wall_on_right()
     stop_rad = target_rad
     edge_seen = False
-    base_speed = 5.0
+    base_speed = MAX_SPEED
     remaining_speed = base_speed
 
     while robot.step(timestep) != -1:
@@ -230,9 +240,8 @@ def step_one_cell_forward():
         left = ps[5]
         right = ps[2]
 
-        print(f"front={front:.0f}  left={left:.0f}  right={right:.0f}")
-        # if is_goal_reached():
-        #     return True
+        # print(f"front={front:.0f}  left={left:.0f}  right={right:.0f}")
+
         if max(distance_sensors[0].getValue(), distance_sensors[7].getValue()) > FRONT_STOP:
             break
 
@@ -242,7 +251,7 @@ def step_one_cell_forward():
             edge_seen = True
             stop_rad = travelled + EDGE_OFFSET / WHEEL_RADIUS
             remaining_speed = speed_for_remaining((stop_rad - travelled) * WHEEL_RADIUS)
-            corrector.walls_lost = True            # brak sciany, jedz prosto bez korekty
+            corrector.walls_lost = True            # brak sciany - jedz prosto bez korekty
 
         if travelled >= stop_rad:
             if edge_seen and is_wall_in_front():
@@ -257,8 +266,7 @@ def step_one_cell_forward():
         left_motor.setVelocity(vl)
         right_motor.setVelocity(vr)
 
-    left_motor.setVelocity(0.0)
-    right_motor.setVelocity(0.0)
+    stop_motors()
     return False
  
             
@@ -293,16 +301,177 @@ def left_hand_strategy():
         turn_90_degrees("left")
         turn_90_degrees("left")
 
+
+def stop_motors():
+    left_motor.setVelocity(0.0)
+    right_motor.setVelocity(0.0)
+
+
+# Flood fill
+
+
+N, E, S, W = 0, 1, 2, 3
+DX = (0, 1, 0, -1)
+DY = (1, 0, -1, 0)
+DIR_NAMES = "NESW"
+OPPOSITE = {N: S, S: N, E: W, W: E}
+
+MAZE_PARAMS = {
+    "maze_1":{
+        "w": 5,
+        "h": 5,
+        "start": (0, 0),
+        "start_heading": N,
+        "goal": (4, 4)
+    },
+    "maze_2":{
+        "w": 8,
+        "h": 8,
+        "start": (0, 0),
+        "start_heading": N,
+        "goal": (7, 7)
+    }
+}
+
+CURR_MAZE = "maze_2"
+GOAL = MAZE_PARAMS[CURR_MAZE]["goal"]
+pos_x, pos_y = MAZE_PARAMS[CURR_MAZE]["start"]
+heading = MAZE_PARAMS[CURR_MAZE]["start_heading"]
+
+
+class SimpleMazeMap:
+    """Mapa ścian oparta na słowniku, zna wspolrzedne pkt koncowego i wymiary"""
+
+    def __init__(self, maze_name):
+        params = MAZE_PARAMS.get(maze_name, {})
+        self.w, self.h = params.get("w"), params.get("h")
+        self.maze_name = maze_name
+        # Dla każdego pola trzymamy zbiór kierunków, w których są ściany
+        self.walls = {(x, y): set() for x in range(self.w) for y in range(self.h)}
+        self.visited = [[False] * self.h for _ in range(self.w)]
+        
+        # Automatyczne dodanie zewnętrznych ścian granicznych labiryntu
+        for x in range(self.w):
+            self.walls[(x, 0)].add(S)
+            self.walls[(x, self.h - 1)].add(N)
+        for y in range(self.h):
+            self.walls[(0, y)].add(W)
+            self.walls[(self.w - 1, y)].add(E)
+
+    def in_bounds(self, x, y):
+        return 0 <= x < self.w and 0 <= y < self.h
+
+    def has_wall(self, x, y, d):
+        return d in self.walls.get((x, y), set())
+
+    def set_wall(self, x, y, d):
+        """Zapisuje ścianę w danej kratce oraz automatycznie u sąsiada."""
+        self.walls[(x, y)].add(d)
+        nx, ny = x + DX[d], y + DY[d]
+        if self.in_bounds(nx, ny):
+            self.walls[(nx, ny)].add(OPPOSITE[d])
+
+    def flood(self, goal):
+        """Algorytm bfs liczacy odległości do mety dla kazdej komórki"""
+        INF = 10 ** 9
+        dist = [[INF] * self.h for _ in range(self.w)]
+        q = deque()
+        
+        gx, gy = goal
+        dist[gx][gy] = 0
+        q.append((gx, gy))
+            
+        while q:
+            x, y = q.popleft()
+            for d in range(4):
+                if self.has_wall(x, y, d):
+                    continue
+                next_x, next_y = x + DX[d], y + DY[d]
+                if self.in_bounds(next_x, next_y) and dist[next_x][next_y] > dist[x][y] + 1:
+                    dist[next_x][next_y] = dist[x][y] + 1
+                    q.append((next_x, next_y))
+        return dist
+
+
+maze = SimpleMazeMap(CURR_MAZE)
+
+
+def sense_walls():
+    """Zapisuje ściany widziane przez czujniki robota"""
+    if is_wall_in_front():
+        maze.set_wall(pos_x, pos_y, heading)
+    if is_wall_on_right():
+        maze.set_wall(pos_x, pos_y, (heading + 1) % 4)
+    if is_wall_on_left():
+        maze.set_wall(pos_x, pos_y, (heading + 3) % 4)
+    maze.visited[pos_x][pos_y] = True
+
+
+def turn_to(new_heading):
+    """Obraca robota do danego kierunku"""
+    global heading
+    diff = (new_heading - heading) % 4
+    if diff == 1:
+        turn_90_degrees("right")
+    elif diff == 3:
+        turn_90_degrees("left")
+    elif diff == 2:
+        turn_90_degrees("right")
+        turn_90_degrees("right")
+    heading = new_heading
+
+
+def choose_direction(dist):
+    """Wybiera sąsiada o najmniejszej odległości do mety"""
+    best_dir, best_val = None, dist[pos_x][pos_y]
+    for d in (heading, (heading + 1) % 4, (heading + 3) % 4, (heading + 2) % 4):
+        if maze.has_wall(pos_x, pos_y, d):
+            continue
+        nx, ny = pos_x + DX[d], pos_y + DY[d]
+        if maze.in_bounds(nx, ny):
+            val = dist[nx][ny]
+            if val < best_val:
+                best_dir, best_val = d, val
+    return best_dir
+
+
+def flood_fill_strategy():
+    """Pojedynczy krok algorytmu flood fill"""
+    global pos_x, pos_y
+
+    if (pos_x, pos_y) == GOAL or is_goal_reached():
+        return True
+
+    align_to_front_wall()
+    sense_walls()
+    dist = maze.flood(GOAL)
+
+    best = choose_direction(dist)
+    if best is None:
+        stop_motors()
+        print("Brak drogi do mety!")
+        return True
+
+    turn_to(best)
+    if is_wall_in_front():
+        maze.set_wall(pos_x, pos_y, heading)
+        return False
+
+    step_one_cell_forward()
+    pos_x += DX[heading]
+    pos_y += DY[heading]
+    return False
+
 # --- Main loop ---------------------------------------------------------------
 while robot.step(timestep) != -1:
-#   if is_goal_reached():
-#     print("META OSIĄGNIĘTA!")
-#     left_motor.setVelocity(0.0)
-#     right_motor.setVelocity(0.0)
-#     break
+    if is_goal_reached():
+        print("META OSIĄGNIĘTA!")
+        stop_motors()
+        break
 
     # strategia testowana
-    right_hand_strategy()
+    # right_hand_strategy()
+    flood_fill_strategy()
     
 
     # Uncomment to see the sensor values in the console:
