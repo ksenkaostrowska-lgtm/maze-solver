@@ -160,7 +160,7 @@ def align_to_front_wall(target=FRONT_STOP, timeout_steps=50):
             return
         s0 = distance_sensors[0].getValue()
         s7 = distance_sensors[7].getValue()
-        if min(s0, s7) < SIDE_WALL:
+        if min(s0, s7) < WALL_CLOSE:
             break
         dist_err = ((s0 + s7) / 2.0 - target) * 0.01
         angle_err = (s0 - s7) * 0.01       # >0: prawy blizej -> obroc w prawo
@@ -267,15 +267,16 @@ def right_hand_strategy():
     align_to_front_wall()
     if not is_wall_on_right():
         turn_90_degrees("right")
-        step_one_cell_forward()
+        return step_one_cell_forward()
     elif not is_wall_in_front():
-        step_one_cell_forward()
+        return step_one_cell_forward()
     elif not is_wall_on_left():
         turn_90_degrees("left")
-        step_one_cell_forward()
+        return step_one_cell_forward()
     else:
         turn_90_degrees("right")
         turn_90_degrees("right")
+        return False
 
 
 def left_hand_strategy():
@@ -283,15 +284,16 @@ def left_hand_strategy():
     align_to_front_wall()
     if not is_wall_on_left():
         turn_90_degrees("left")
-        step_one_cell_forward()
+        return step_one_cell_forward()
     elif not is_wall_in_front():
-        step_one_cell_forward()
+        return step_one_cell_forward()
     elif not is_wall_on_right():
         turn_90_degrees("right")
-        step_one_cell_forward()
+        return step_one_cell_forward()
     else:
         turn_90_degrees("left")
         turn_90_degrees("left")
+        return False
 
 
 def stop_motors():
@@ -457,19 +459,17 @@ def choose_direction(maze, pos_x, pos_y, heading, dist):
 
 def run_right_hand():
     while robot.step(timestep) != -1:
-        if is_goal_reached():
+        if is_goal_reached()or right_hand_strategy():
             print("META OSIĄGNIĘTA!")
             stop_motors()
             return
-        right_hand_strategy()
 
 def run_left_hand():
     while robot.step(timestep) != -1:
-        if is_goal_reached():
+        if is_goal_reached() or left_hand_strategy():
             print("META OSIĄGNIĘTA!")
             stop_motors()
             return
-        left_hand_strategy()
 
 
 def run_simple_flood_fill(maze_name):
